@@ -1,6 +1,4 @@
-use std::collections::HashSet;
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stone {
     Empty,
     Black,
@@ -8,11 +6,52 @@ pub enum Stone {
 }
 
 impl Stone {
-    pub fn opponent(self) -> Stone {
+    pub fn other(self) -> Stone {
         match self {
             Stone::Black => Stone::White,
             Stone::White => Stone::Black,
             Stone::Empty => Stone::Empty,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Stone::Black => "Black",
+            Stone::White => "White",
+            Stone::Empty => "Nobody",
+        }
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Stone::Black => "●",
+            Stone::White => "○",
+            Stone::Empty => " ",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Play {
+    Point(usize),
+    Pass,
+}
+
+pub struct Neighbors {
+    points: [usize; 4],
+    count: usize,
+    at: usize,
+}
+
+impl Iterator for Neighbors {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.at < self.count {
+            self.at += 1;
+            Some(self.points[self.at - 1])
+        } else {
+            None
         }
     }
 }
@@ -20,104 +59,211 @@ impl Stone {
 #[derive(Clone)]
 pub struct Board {
     pub size: usize,
-    pub grid: Vec<Vec<Stone>>,
+    cells: Vec<Stone>,
+    seen: Vec<u32>,
+    stamp: u32,
+    stack: Vec<usize>,
 }
 
 impl Board {
-    pub fn new(size: usize) -> Self {
-        Self {
+    pub fn new(size: usize) -> Board {
+        Board {
             size,
-            grid: vec![vec![Stone::Empty; size]; size],
+            cells: vec![Stone::Empty; size * size],
+            seen: vec![0; size * size],
+            stamp: 0,
+            stack: Vec::with_capacity(size * size),
         }
     }
 
-    pub fn get(&self, r: usize, c: usize) -> Stone {
-        self.grid[r][c]
+    pub fn points(&self) -> usize {
+        self.cells.len()
     }
 
-    pub fn set(&mut self, r: usize, c: usize, s: Stone) {
-        self.grid[r][c] = s;
+    pub fn point(&self, row: usize, col: usize) -> usize {
+        row * self.size + col
     }
 
-    pub fn neighbors(&self, r: usize, c: usize) -> Vec<(usize, usize)> {
-        let mut n = Vec::new();
-        if r > 0 { n.push((r - 1, c)); }
-        if r + 1 < self.size { n.push((r + 1, c)); }
-        if c > 0 { n.push((r, c - 1)); }
-        if c + 1 < self.size { n.push((r, c + 1)); }
-        n
+    pub fn row_col(&self, p: usize) -> (usize, usize) {
+        (p / self.size, p % self.size)
     }
 
-    // Find all stones in the same connected group
-    pub fn find_group(&self, r: usize, c: usize) -> HashSet<(usize, usize)> {
-        let color = self.get(r, c);
-        let mut group = HashSet::new();
-        let mut stack = vec![(r, c)];
-        while let Some((cr, cc)) = stack.pop() {
-            if group.contains(&(cr, cc)) { continue; }
-            if self.get(cr, cc) == color {
-                group.insert((cr, cc));
-                for nb in self.neighbors(cr, cc) {
-                    if !group.contains(&nb) {
-                        stack.push(nb);
+    pub fn at(&self, p: usize) -> Stone {
+        self.cells[p]
+    }
+
+    pub fn put(&mut self, p: usize, stone: Stone) {
+        self.cells[p] = stone;
+    }
+
+    pub fn neighbors(&self, p: usize) -> Neighbors {
+        let (row, col) = self.row_col(p);
+        let mut points = [0usize; 4];
+        let mut count = 0;
+        if row > 0 {
+            points[count] = p - self.size;
+            count += 1;
+        }
+        if row + 1 < self.size {
+            points[count] = p + self.size;
+            count += 1;
+        }
+        if col > 0 {
+            points[count] = p - 1;
+            count += 1;
+        }
+        if col + 1 < self.size {
+            points[count] = p + 1;
+            count += 1;
+        }
+        Neighbors {
+            points,
+            count,
+            at: 0,
+        }
+    }
+
+    pub fn diagonals(&self, p: usize) -> Neighbors {
+        let (row, col) = self.row_col(p);
+        let mut points = [0usize; 4];
+        let mut count = 0;
+        if row > 0 && col > 0 {
+            points[count] = p - self.size - 1;
+            count += 1;
+        }
+        if row > 0 && col + 1 < self.size {
+            points[count] = p - self.size + 1;
+            count += 1;
+        }
+        if row + 1 < self.size && col > 0 {
+            points[count] = p + self.size - 1;
+            count += 1;
+        }
+        if row + 1 < self.size && col + 1 < self.size {
+            points[count] = p + self.size + 1;
+            count += 1;
+        }
+        Neighbors {
+            points,
+            count,
+            at: 0,
+        }
+    }
+
+    pub fn on_edge(&self, p: usize) -> bool {
+        let (row, col) = self.row_col(p);
+        row == 0 || col == 0 || row + 1 == self.size || col + 1 == self.size
+    }
+
+    fn start_walk(&mut self, start: usize) -> u32 {
+        self.stamp += 1;
+        if self.stamp == u32::MAX {
+            for slot in self.seen.iter_mut() {
+                *slot = 0;
+            }
+            self.stamp = 1;
+        }
+        self.stack.clear();
+        self.stack.push(start);
+        self.seen[start] = self.stamp;
+        self.stamp
+    }
+
+    pub fn liberties(&mut self, start: usize) -> usize {
+        let color = self.cells[start];
+        let stamp = self.start_walk(start);
+        let mut liberties = 0;
+        while let Some(p) = self.stack.pop() {
+            for n in self.neighbors(p) {
+                if self.seen[n] == stamp {
+                    continue;
+                }
+                self.seen[n] = stamp;
+                if self.cells[n] == Stone::Empty {
+                    liberties += 1;
+                } else if self.cells[n] == color {
+                    self.stack.push(n);
+                }
+            }
+        }
+        liberties
+    }
+
+    pub fn last_liberty(&mut self, start: usize) -> Option<usize> {
+        let color = self.cells[start];
+        let stamp = self.start_walk(start);
+        let mut found = None;
+        while let Some(p) = self.stack.pop() {
+            for n in self.neighbors(p) {
+                if self.seen[n] == stamp {
+                    continue;
+                }
+                self.seen[n] = stamp;
+                if self.cells[n] == Stone::Empty {
+                    if found.is_some() {
+                        return None;
                     }
+                    found = Some(n);
+                } else if self.cells[n] == color {
+                    self.stack.push(n);
                 }
             }
         }
-        group
+        found
     }
 
-    // Count liberties (empty adjacent intersections) for a group
-    pub fn liberties(&self, group: &HashSet<(usize, usize)>) -> usize {
-        let mut libs = HashSet::new();
-        for &(r, c) in group {
-            for (nr, nc) in self.neighbors(r, c) {
-                if self.get(nr, nc) == Stone::Empty {
-                    libs.insert((nr, nc));
+    pub fn alone(&self, p: usize) -> bool {
+        let color = self.cells[p];
+        !self.neighbors(p).any(|n| self.cells[n] == color)
+    }
+
+    fn take_group(&mut self, start: usize) -> (usize, usize) {
+        let color = self.cells[start];
+        let stamp = self.start_walk(start);
+        let mut taken = 0;
+        let mut last = start;
+        while let Some(p) = self.stack.pop() {
+            self.cells[p] = Stone::Empty;
+            taken += 1;
+            last = p;
+            for n in self.neighbors(p) {
+                if self.seen[n] != stamp && self.cells[n] == color {
+                    self.seen[n] = stamp;
+                    self.stack.push(n);
                 }
             }
         }
-        libs.len()
-    }
-
-    // Remove a group from the board, returns the count removed
-    pub fn remove_group(&mut self, group: &HashSet<(usize, usize)>) -> usize {
-        let count = group.len();
-        for &(r, c) in group {
-            self.set(r, c, Stone::Empty);
-        }
-        count
-    }
-
-    pub fn grid_eq(&self, other: &Board) -> bool {
-        self.grid == other.grid
+        (taken, last)
     }
 }
 
+#[derive(Clone)]
 pub struct Game {
     pub board: Board,
-    pub current: Stone,       // whose turn it is
-    pub captures: [usize; 2], // [black_captures, white_captures]
-    pub consecutive_passes: usize,
-    pub game_over: bool,
+    pub turn: Stone,
+    pub captured: [usize; 2],
+    pub passes: usize,
+    pub finished: bool,
     pub winner: Option<Stone>,
     pub komi: f32,
-    prev_board: Option<Board>, // for ko rule
-    pub move_count: usize,
+    pub ko: Option<usize>,
+    pub move_number: usize,
+    pub handicap: u8,
 }
 
 impl Game {
-    pub fn new(size: usize) -> Self {
-        Self {
+    pub fn new(size: usize, komi: f32) -> Game {
+        Game {
             board: Board::new(size),
-            current: Stone::Black,
-            captures: [0, 0],
-            consecutive_passes: 0,
-            game_over: false,
+            turn: Stone::Black,
+            captured: [0, 0],
+            passes: 0,
+            finished: false,
             winner: None,
-            komi: 6.5,
-            prev_board: None,
-            move_count: 0,
+            komi,
+            ko: None,
+            move_number: 0,
+            handicap: 0,
         }
     }
 
@@ -125,258 +271,349 @@ impl Game {
         self.board.size
     }
 
-    // Try to place a stone; returns true if valid
-    pub fn place(&mut self, r: usize, c: usize) -> bool {
-        if self.game_over { return false; }
-        if self.board.get(r, c) != Stone::Empty { return false; }
-
-        let mut trial = self.board.clone();
-        trial.set(r, c, self.current);
-
-        // Capture opponent stones with no liberties
-        let opponent = self.current.opponent();
-        let mut captured = 0;
-        for (nr, nc) in trial.neighbors(r, c) {
-            if trial.get(nr, nc) == opponent {
-                let grp = trial.find_group(nr, nc);
-                if trial.liberties(&grp) == 0 {
-                    captured += trial.remove_group(&grp);
-                }
-            }
-        }
-
-        // Suicide rule: if the placed stone's group has no liberties, invalid
-        let placed_group = trial.find_group(r, c);
-        if trial.liberties(&placed_group) == 0 {
+    pub fn legal(&mut self, p: usize) -> bool {
+        if self.finished || self.board.at(p) != Stone::Empty || self.ko == Some(p) {
             return false;
         }
+        let me = self.turn;
+        for n in self.board.neighbors(p) {
+            let stone = self.board.at(n);
+            if stone == Stone::Empty {
+                return true;
+            }
+            if stone == me {
+                if self.board.liberties(n) > 1 {
+                    return true;
+                }
+            } else if self.board.liberties(n) == 1 {
+                return true;
+            }
+        }
+        false
+    }
 
-        // Ko rule: new board state must differ from the state before last move
-        if let Some(ref prev) = self.prev_board {
-            if trial.grid_eq(prev) {
-                return false;
+    pub fn play(&mut self, p: usize) -> bool {
+        if !self.legal(p) {
+            return false;
+        }
+        let me = self.turn;
+        let enemy = me.other();
+        self.board.put(p, me);
+
+        let mut taken = 0;
+        let mut last_taken = 0;
+        for n in self.board.neighbors(p) {
+            if self.board.at(n) == enemy && self.board.liberties(n) == 0 {
+                let (count, last) = self.board.take_group(n);
+                taken += count;
+                last_taken = last;
             }
         }
 
-        // Commit move
-        self.prev_board = Some(self.board.clone());
-        self.board = trial;
-        if self.current == Stone::Black {
-            self.captures[0] += captured;
+        let single = self.board.alone(p);
+        let liberties = self.board.liberties(p);
+        self.ko = if taken == 1 && single && liberties == 1 {
+            Some(last_taken)
         } else {
-            self.captures[1] += captured;
+            None
+        };
+
+        if me == Stone::Black {
+            self.captured[0] += taken;
+        } else {
+            self.captured[1] += taken;
         }
-        self.consecutive_passes = 0;
-        self.move_count += 1;
-        self.current = opponent;
+        self.passes = 0;
+        self.move_number += 1;
+        self.turn = enemy;
         true
     }
 
     pub fn pass(&mut self) {
-        if self.game_over { return; }
-        self.consecutive_passes += 1;
-        self.move_count += 1;
-        if self.consecutive_passes >= 2 {
-            self.game_over = true;
+        if self.finished {
+            return;
         }
-        self.current = self.current.opponent();
+        self.passes += 1;
+        self.move_number += 1;
+        self.ko = None;
+        self.turn = self.turn.other();
+        if self.passes >= 2 {
+            self.finished = true;
+        }
     }
 
-    pub fn resign(&mut self, resigning: Stone) {
-        self.game_over = true;
-        self.winner = Some(resigning.opponent());
-    }
-
-    // Chinese scoring: stones + territory + komi for white
-    pub fn score(&self) -> (f32, f32) {
-        let size = self.board.size;
-        let mut black_stones = 0usize;
-        let mut white_stones = 0usize;
-
-        for r in 0..size {
-            for c in 0..size {
-                match self.board.get(r, c) {
-                    Stone::Black => black_stones += 1,
-                    Stone::White => white_stones += 1,
-                    Stone::Empty => {}
-                }
+    pub fn make(&mut self, play: Play) -> bool {
+        match play {
+            Play::Point(p) => self.play(p),
+            Play::Pass => {
+                self.pass();
+                true
             }
         }
+    }
 
-        let (black_territory, white_territory) = self.count_territory();
+    pub fn resign(&mut self, loser: Stone) {
+        self.finished = true;
+        self.winner = Some(loser.other());
+    }
 
-        let black = (black_stones + black_territory) as f32;
-        let white = (white_stones + white_territory) as f32 + self.komi;
+    pub fn is_eye(&self, p: usize, color: Stone) -> bool {
+        if self.board.at(p) != Stone::Empty {
+            return false;
+        }
+        for n in self.board.neighbors(p) {
+            if self.board.at(n) != color {
+                return false;
+            }
+        }
+        let mut enemy_corners = 0;
+        for d in self.board.diagonals(p) {
+            if self.board.at(d) == color.other() {
+                enemy_corners += 1;
+            }
+        }
+        if self.board.on_edge(p) {
+            enemy_corners == 0
+        } else {
+            enemy_corners <= 1
+        }
+    }
+
+    pub fn score(&self) -> (f32, f32) {
+        let mut black = 0.0;
+        let mut white = self.komi;
+        let owners = self.territory();
+        for p in 0..self.board.points() {
+            match self.board.at(p) {
+                Stone::Black => black += 1.0,
+                Stone::White => white += 1.0,
+                Stone::Empty => match owners[p] {
+                    Some(Stone::Black) => black += 1.0,
+                    Some(Stone::White) => white += 1.0,
+                    _ => {}
+                },
+            }
+        }
         (black, white)
     }
 
-    fn count_territory(&self) -> (usize, usize) {
-        let size = self.board.size;
-        let mut visited = vec![vec![false; size]; size];
-        let mut black_territory = 0;
-        let mut white_territory = 0;
+    pub fn lead(&self) -> f32 {
+        let (black, white) = self.score();
+        black - white
+    }
 
-        for r in 0..size {
-            for c in 0..size {
-                if self.board.get(r, c) == Stone::Empty && !visited[r][c] {
-                    // Flood fill this empty region
-                    let mut region = Vec::new();
-                    let mut borders = HashSet::new();
-                    let mut stack = vec![(r, c)];
-                    while let Some((cr, cc)) = stack.pop() {
-                        if visited[cr][cc] { continue; }
-                        visited[cr][cc] = true;
-                        region.push((cr, cc));
-                        for (nr, nc) in self.board.neighbors(cr, cc) {
-                            match self.board.get(nr, nc) {
-                                Stone::Empty => {
-                                    if !visited[nr][nc] {
-                                        stack.push((nr, nc));
-                                    }
-                                }
-                                s => { borders.insert(s); }
+    pub fn territory(&self) -> Vec<Option<Stone>> {
+        let count = self.board.points();
+        let mut owners = vec![None; count];
+        let mut seen = vec![false; count];
+
+        for start in 0..count {
+            if self.board.at(start) != Stone::Empty || seen[start] {
+                continue;
+            }
+            let mut region = Vec::new();
+            let mut touches_black = false;
+            let mut touches_white = false;
+            let mut stack = vec![start];
+            seen[start] = true;
+            while let Some(p) = stack.pop() {
+                region.push(p);
+                for n in self.board.neighbors(p) {
+                    match self.board.at(n) {
+                        Stone::Black => touches_black = true,
+                        Stone::White => touches_white = true,
+                        Stone::Empty => {
+                            if !seen[n] {
+                                seen[n] = true;
+                                stack.push(n);
                             }
                         }
                     }
-                    // Assign territory if only one color borders the region
-                    if borders.len() == 1 {
-                        let owner = *borders.iter().next().unwrap();
-                        match owner {
-                            Stone::Black => black_territory += region.len(),
-                            Stone::White => white_territory += region.len(),
-                            Stone::Empty => {}
-                        }
-                    }
                 }
             }
+            let owner = match (touches_black, touches_white) {
+                (true, false) => Some(Stone::Black),
+                (false, true) => Some(Stone::White),
+                _ => None,
+            };
+            for p in region {
+                owners[p] = owner;
+            }
         }
-
-        (black_territory, white_territory)
+        owners
     }
 
-    pub fn valid_moves(&self) -> Vec<(usize, usize)> {
+    pub fn place_handicap(&mut self, stones: u8) {
+        for p in self.handicap_points(stones) {
+            self.board.put(p, Stone::Black);
+        }
+        if stones > 0 {
+            self.handicap = stones;
+            self.turn = Stone::White;
+        }
+    }
+
+    pub fn handicap_points(&self, stones: u8) -> Vec<usize> {
         let size = self.board.size;
-        let mut moves = Vec::new();
-        for r in 0..size {
-            for c in 0..size {
-                if self.board.get(r, c) == Stone::Empty {
-                    let mut trial = self.clone_for_trial();
-                    if trial.place(r, c) {
-                        moves.push((r, c));
-                    }
-                }
+        if size < 9 || stones < 2 {
+            return Vec::new();
+        }
+        let edge = if size > 9 { 3 } else { 2 };
+        let far = size - 1 - edge;
+        let mid = size / 2;
+        let corners = [(far, edge), (edge, far), (edge, edge), (far, far)];
+        let sides = [(mid, edge), (mid, far), (edge, mid), (far, mid)];
+
+        let count = stones.min(9) as usize;
+        let mut spots = corners[..count.min(4)].to_vec();
+        if count > 4 {
+            let side_count = if count % 2 == 1 { count - 5 } else { count - 4 };
+            spots.extend(sides.iter().take(side_count));
+            if count % 2 == 1 {
+                spots.push((mid, mid));
             }
         }
-        moves
+        spots
+            .into_iter()
+            .map(|(r, c)| self.board.point(r, c))
+            .collect()
     }
 
-    fn clone_for_trial(&self) -> Game {
-        self.clone_state()
-    }
-
-    pub fn clone_state(&self) -> Game {
-        Game {
-            board: self.board.clone(),
-            current: self.current,
-            captures: self.captures,
-            consecutive_passes: self.consecutive_passes,
-            game_over: self.game_over,
-            winner: self.winner,
-            komi: self.komi,
-            prev_board: self.prev_board.clone(),
-            move_count: self.move_count,
-        }
-    }
-
-    // Territory map: for each empty intersection, which player owns it (None = contested)
-    pub fn territory_map(&self) -> Vec<Vec<Option<Stone>>> {
+    pub fn star_points(&self) -> Vec<usize> {
         let size = self.board.size;
-        let mut map = vec![vec![None::<Stone>; size]; size];
-        let mut visited = vec![vec![false; size]; size];
-
-        for r in 0..size {
-            for c in 0..size {
-                if self.board.get(r, c) == Stone::Empty && !visited[r][c] {
-                    let mut region = Vec::new();
-                    let mut borders = HashSet::new();
-                    let mut stack = vec![(r, c)];
-                    while let Some((cr, cc)) = stack.pop() {
-                        if visited[cr][cc] { continue; }
-                        visited[cr][cc] = true;
-                        region.push((cr, cc));
-                        for (nr, nc) in self.board.neighbors(cr, cc) {
-                            match self.board.get(nr, nc) {
-                                Stone::Empty => { if !visited[nr][nc] { stack.push((nr, nc)); } }
-                                s => { borders.insert(s); }
-                            }
-                        }
-                    }
-                    let owner = if borders.len() == 1 {
-                        borders.into_iter().next()
-                    } else {
-                        None
-                    };
-                    for pos in region {
-                        map[pos.0][pos.1] = owner;
-                    }
-                }
-            }
+        if size < 9 {
+            return Vec::new();
         }
-        map
+        let edge = if size > 9 { 3 } else { 2 };
+        let far = size - 1 - edge;
+        let mid = size / 2;
+        let mut spots = vec![(edge, edge), (edge, far), (far, edge), (far, far)];
+        if size % 2 == 1 {
+            spots.push((mid, mid));
+        }
+        if size >= 19 {
+            spots.extend([(edge, mid), (mid, edge), (mid, far), (far, mid)]);
+        }
+        spots
+            .into_iter()
+            .map(|(r, c)| self.board.point(r, c))
+            .collect()
+    }
+}
+
+pub fn coord_name(p: usize, size: usize) -> String {
+    let letters = "ABCDEFGHJKLMNOPQRSTUVWXYZ";
+    let row = p / size;
+    let col = p % size;
+    let letter = letters.chars().nth(col).unwrap_or('?');
+    format!("{}{}", letter, size - row)
+}
+
+pub fn play_name(play: Play, size: usize) -> String {
+    match play {
+        Play::Point(p) => coord_name(p, size),
+        Play::Pass => "pass".to_string(),
+    }
+}
+
+pub fn parse_coord(text: &str, size: usize) -> Option<usize> {
+    let letters = "ABCDEFGHJKLMNOPQRSTUVWXYZ";
+    let text = text.trim().to_uppercase();
+    let mut chars = text.chars();
+    let letter = chars.next()?;
+    let col = letters.find(letter)?;
+    let number: usize = chars.as_str().parse().ok()?;
+    if col >= size || number == 0 || number > size {
+        return None;
+    }
+    Some((size - number) * size + col)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(game: &Game, row: usize, col: usize) -> usize {
+        game.board.point(row, col)
     }
 
-    // Place handicap stones for Black at standard positions (call before game starts)
-    pub fn place_handicap(&mut self, n: u8) {
-        for &(r, c) in &self.handicap_positions(n) {
-            self.board.set(r, c, Stone::Black);
-        }
-        if n > 0 {
-            self.current = Stone::White; // White goes first after handicap
-        }
+    #[test]
+    fn capture_removes_the_group() {
+        let mut game = Game::new(9, 6.5);
+        game.play(at(&game, 0, 1));
+        game.play(at(&game, 0, 0));
+        game.play(at(&game, 1, 0));
+        assert_eq!(game.board.at(at(&game, 0, 0)), Stone::Empty);
+        assert_eq!(game.captured[0], 1);
     }
 
-    pub fn handicap_positions(&self, n: u8) -> Vec<(usize, usize)> {
-        // Standard positions indexed by stone count; order matters
-        let all: &[(usize, usize)] = match self.board.size {
-            19 => &[
-                (15, 3), (3, 15), (3, 3), (15, 15), // corners
-                (9, 9),                               // tengen
-                (9, 3), (9, 15),                     // sides
-                (15, 9), (3, 9),
-            ],
-            13 => &[
-                (9, 3), (3, 9), (3, 3), (9, 9),
-                (6, 6),
-                (6, 3), (6, 9),
-            ],
-            9 => &[
-                (6, 2), (2, 6), (2, 2), (6, 6),
-                (4, 4),
-            ],
-            _ => &[],
-        };
-        all.iter().take(n as usize).copied().collect()
+    #[test]
+    fn suicide_is_not_allowed() {
+        let mut game = Game::new(9, 6.5);
+        game.play(at(&game, 0, 1));
+        game.pass();
+        game.play(at(&game, 1, 0));
+        assert_eq!(game.turn, Stone::White);
+        assert!(!game.legal(at(&game, 0, 0)));
     }
 
-    // Star points for visual reference on the board
-    pub fn star_points(&self) -> Vec<(usize, usize)> {
-        match self.board.size {
-            19 => vec![
-                (3, 3), (3, 9), (3, 15),
-                (9, 3), (9, 9), (9, 15),
-                (15, 3), (15, 9), (15, 15),
-            ],
-            13 => vec![
-                (3, 3), (3, 9),
-                (6, 6),
-                (9, 3), (9, 9),
-            ],
-            9 => vec![
-                (2, 2), (2, 6),
-                (4, 4),
-                (6, 2), (6, 6),
-            ],
-            _ => vec![],
+    #[test]
+    fn filling_the_last_liberty_takes_the_whole_group() {
+        let mut game = Game::new(9, 6.5);
+        for (row, col) in [(0, 0), (0, 1)] {
+            game.board.put(at(&game, row, col), Stone::White);
         }
+        for (row, col) in [(1, 0), (1, 1)] {
+            game.board.put(at(&game, row, col), Stone::Black);
+        }
+        game.turn = Stone::Black;
+        assert!(game.play(at(&game, 0, 2)));
+        assert_eq!(game.board.at(at(&game, 0, 0)), Stone::Empty);
+        assert_eq!(game.board.at(at(&game, 0, 1)), Stone::Empty);
+        assert_eq!(game.captured[0], 2);
+    }
+
+    #[test]
+    fn ko_blocks_the_immediate_recapture() {
+        let mut game = Game::new(9, 6.5);
+        let black = [(0, 1), (1, 0), (2, 1)];
+        let white = [(0, 2), (1, 3), (2, 2), (1, 1)];
+        for &(row, col) in &black {
+            game.board.put(at(&game, row, col), Stone::Black);
+        }
+        for &(row, col) in &white {
+            game.board.put(at(&game, row, col), Stone::White);
+        }
+        game.turn = Stone::Black;
+        assert!(game.play(at(&game, 1, 2)));
+        assert_eq!(game.board.at(at(&game, 1, 1)), Stone::Empty);
+        assert!(!game.legal(at(&game, 1, 1)));
+    }
+
+    #[test]
+    fn territory_goes_to_the_surrounding_colour() {
+        let mut game = Game::new(9, 0.0);
+        for col in 0..9 {
+            game.board.put(game.board.point(4, col), Stone::Black);
+        }
+        let owners = game.territory();
+        assert_eq!(owners[game.board.point(0, 0)], Some(Stone::Black));
+        assert_eq!(owners[game.board.point(8, 0)], Some(Stone::Black));
+    }
+
+    #[test]
+    fn two_passes_end_the_game() {
+        let mut game = Game::new(9, 6.5);
+        game.pass();
+        game.pass();
+        assert!(game.finished);
+    }
+
+    #[test]
+    fn coordinates_skip_the_letter_i() {
+        assert_eq!(coord_name(0, 19), "A19");
+        assert_eq!(coord_name(8, 19), "J19");
+        assert_eq!(parse_coord("J19", 19), Some(8));
+        assert_eq!(parse_coord("I19", 19), None);
     }
 }
