@@ -1,11 +1,14 @@
+use crate::ai;
+use crate::analysis::{Analysis, winrate_from_lead};
+use crate::config::Config;
+use crate::game::{Game, Play, Stone, play_name};
+use crate::gtp::{GtpEngine, engine_installed};
+use crate::sgf;
+use crate::theme::{Theme, theme_at};
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::Receiver;
-use std::time::Instant;
-use crate::ai::{best_move, Difficulty};
-use crate::game::{Game, Stone};
-use crate::gtp::{GtpEngine, to_gtp};
-
-// ─── Screens ─────────────────────────────────────────────────────────────────
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Screen {
@@ -13,708 +16,898 @@ pub enum Screen {
     Setup,
     Playing,
     Review,
-    GameOver,
+    Browser,
+    Themes,
+    Help,
 }
 
-// ─── Setup options ────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GameMode {
-    VsAI,
-    TwoPlayer,
+#[derive(Clone, Copy, PartialEq)]
+pub enum Mode {
+    Engine,
+    Friend,
 }
 
-impl GameMode {
-    pub fn label(self) -> &'static str {
-        match self { GameMode::VsAI => "vs AI", GameMode::TwoPlayer => "2 Players (local)" }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum EngineKind {
-    BuiltIn,
-    GnuGo,
-}
-
-impl EngineKind {
-    pub fn label(self) -> &'static str {
-        match self { EngineKind::BuiltIn => "Built-in", EngineKind::GnuGo => "GNU Go" }
-    }
-}
-
-/// How many hints the player gets per game
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HintAllowance {
-    Off,
-    Three,
-    Five,
-    Ten,
-    Unlimited,
-}
-
-impl HintAllowance {
-    pub fn label(self) -> &'static str {
-        match self {
-            HintAllowance::Off => "Off",
-            HintAllowance::Three => "3",
-            HintAllowance::Five => "5",
-            HintAllowance::Ten => "10",
-            HintAllowance::Unlimited => "Unlimited",
-        }
-    }
-    pub fn starting_count(self) -> Option<u8> {
-        match self {
-            HintAllowance::Off => None,
-            HintAllowance::Three => Some(3),
-            HintAllowance::Five => Some(5),
-            HintAllowance::Ten => Some(10),
-            HintAllowance::Unlimited => Some(255), // sentinel for unlimited
-        }
-    }
-    pub fn next(self) -> Self {
-        match self {
-            HintAllowance::Off => HintAllowance::Three,
-            HintAllowance::Three => HintAllowance::Five,
-            HintAllowance::Five => HintAllowance::Ten,
-            HintAllowance::Ten => HintAllowance::Unlimited,
-            HintAllowance::Unlimited => HintAllowance::Off,
-        }
-    }
-    pub fn prev(self) -> Self {
-        match self {
-            HintAllowance::Off => HintAllowance::Unlimited,
-            HintAllowance::Three => HintAllowance::Off,
-            HintAllowance::Five => HintAllowance::Three,
-            HintAllowance::Ten => HintAllowance::Five,
-            HintAllowance::Unlimited => HintAllowance::Ten,
-        }
-    }
+#[derive(Clone, Copy, PartialEq)]
+pub enum EngineChoice {
+    Builtin,
+    External,
 }
 
 #[derive(Clone, Copy)]
 pub struct Setup {
     pub board_size: usize,
-    pub game_mode: GameMode,
-    pub engine: EngineKind,
-    pub engine_level: u8,       // 1-10
-    pub human_color: Stone,
-    pub hints: HintAllowance,
-    pub undo_enabled: bool,
-    pub handicap: u8,           // 0, 2, 3, 4, 5, 6, 9
-    pub time_limit: Option<u64>,
-    pub selected: usize,        // row cursor in setup screen
+    pub mode: Mode,
+    pub engine: EngineChoice,
+    pub level: u8,
+    pub color: Stone,
+    pub handicap: u8,
+    pub komi: f32,
+    pub main_time: Option<u64>,
+    pub increment: u64,
+    pub hints: u32,
+    pub undo: bool,
+    pub eval: bool,
+    pub row: usize,
 }
 
-impl Default for Setup {
-    fn default() -> Self {
-        Self {
-            board_size: 19,
-            game_mode: GameMode::VsAI,
-            engine: EngineKind::GnuGo,
-            engine_level: 5,
-            human_color: Stone::Black,
-            hints: HintAllowance::Three,
-            undo_enabled: true,
-            handicap: 0,
-            time_limit: None,
-            selected: 0,
-        }
-    }
-}
+pub const SETUP_ROWS: usize = 12;
 
 impl Setup {
-    pub fn difficulty(&self) -> Difficulty {
-        match self.engine_level {
-            1..=3 => Difficulty::Easy,
-            4..=7 => Difficulty::Medium,
-            _ => Difficulty::Hard,
+    pub fn from_config(config: &Config) -> Setup {
+        Setup {
+            board_size: config.board_size,
+            mode: Mode::Engine,
+            engine: EngineChoice::External,
+            level: config.level,
+            color: Stone::Black,
+            handicap: 0,
+            komi: config.komi,
+            main_time: None,
+            increment: 0,
+            hints: 3,
+            undo: true,
+            eval: config.show_eval,
+            row: 0,
         }
     }
 
-    pub fn level_label(&self) -> String {
-        match self.engine {
-            EngineKind::GnuGo => format!("{} / 10", self.engine_level),
-            EngineKind::BuiltIn => match self.engine_level {
-                1..=3 => "Easy".to_string(),
-                4..=7 => "Medium".to_string(),
-                _ => "Hard".to_string(),
+    pub fn value(&self, row: usize, engine_name: &str, engine_ready: bool) -> String {
+        match row {
+            0 => format!("{0}x{0}", self.board_size),
+            1 => match self.mode {
+                Mode::Engine => "computer".to_string(),
+                Mode::Friend => "a friend, same keyboard".to_string(),
             },
+            2 => match self.engine {
+                EngineChoice::Builtin => "built-in".to_string(),
+                EngineChoice::External => {
+                    if engine_ready {
+                        engine_name.to_string()
+                    } else {
+                        format!("{} (not installed)", engine_name)
+                    }
+                }
+            },
+            3 => format!("{} of 10", self.level),
+            4 => self.color.name().to_string(),
+            5 => {
+                if self.handicap == 0 {
+                    "none".to_string()
+                } else {
+                    format!("{} stones", self.handicap)
+                }
+            }
+            6 => format!("{}", self.komi),
+            7 => match self.main_time {
+                None => "no clock".to_string(),
+                Some(seconds) => format!("{} min", seconds / 60),
+            },
+            8 => format!("{} s", self.increment),
+            9 => match self.hints {
+                0 => "off".to_string(),
+                u32::MAX => "unlimited".to_string(),
+                n => format!("{}", n),
+            },
+            10 => on_off(self.undo),
+            _ => on_off(self.eval),
         }
     }
 
-    pub fn handicap_label(&self) -> String {
-        if self.handicap == 0 { "None".to_string() } else { format!("{} stones", self.handicap) }
-    }
-}
-
-// ─── Move records ─────────────────────────────────────────────────────────────
-
-pub struct MoveRecord {
-    pub color: Stone,
-    pub coord: Option<(usize, usize)>,
-    pub num: usize,
-}
-
-// ─── Undo snapshot ────────────────────────────────────────────────────────────
-
-struct UndoSnapshot {
-    game: Game,
-    last_move: Option<(usize, usize)>,
-    history_len: usize,
-    snapshots_len: usize,
-}
-
-// ─── Review state ─────────────────────────────────────────────────────────────
-
-pub struct ReviewState {
-    pub snapshots: Vec<Game>,
-    pub history: Vec<MoveRecord>,
-    pub pos: usize, // 0 = empty board, N = after move N
-}
-
-impl ReviewState {
-    pub fn current_board(&self) -> &Game {
-        if self.pos == 0 || self.snapshots.is_empty() {
-            &self.snapshots[0]
-        } else {
-            let idx = (self.pos - 1).min(self.snapshots.len() - 1);
-            &self.snapshots[idx]
+    pub fn active(&self, row: usize) -> bool {
+        match row {
+            2 | 3 | 9 => self.mode == Mode::Engine,
+            4 => self.mode == Mode::Engine,
+            _ => true,
         }
     }
-    pub fn total(&self) -> usize { self.snapshots.len() }
-    pub fn step_forward(&mut self) { if self.pos < self.total() { self.pos += 1; } }
-    pub fn step_back(&mut self) { if self.pos > 0 { self.pos -= 1; } }
+
+    pub fn change(&mut self, forward: bool) {
+        match self.row {
+            0 => self.board_size = cycle(&[9, 13, 19], self.board_size, forward),
+            1 => {
+                self.mode = if self.mode == Mode::Engine {
+                    Mode::Friend
+                } else {
+                    Mode::Engine
+                }
+            }
+            2 => {
+                self.engine = if self.engine == EngineChoice::Builtin {
+                    EngineChoice::External
+                } else {
+                    EngineChoice::Builtin
+                }
+            }
+            3 => self.level = step(self.level, 1, 10, forward),
+            4 => self.color = self.color.other(),
+            5 => self.handicap = cycle(&[0, 2, 3, 4, 5, 6, 7, 8, 9], self.handicap, forward),
+            6 => self.komi = cycle(&[0.0, 0.5, 5.5, 6.5, 7.5], self.komi, forward),
+            7 => {
+                self.main_time = cycle(
+                    &[None, Some(180), Some(300), Some(600), Some(1200), Some(1800)],
+                    self.main_time,
+                    forward,
+                )
+            }
+            8 => self.increment = cycle(&[0, 3, 5, 10, 30], self.increment, forward),
+            9 => self.hints = cycle(&[0, 3, 5, 10, u32::MAX], self.hints, forward),
+            10 => self.undo = !self.undo,
+            _ => self.eval = !self.eval,
+        }
+    }
 }
 
-// ─── Session ─────────────────────────────────────────────────────────────────
+pub const SETUP_LABELS: [&str; SETUP_ROWS] = [
+    "Board",
+    "Play against",
+    "Engine",
+    "Strength",
+    "You play",
+    "Handicap",
+    "Komi",
+    "Main time",
+    "Increment",
+    "Hints",
+    "Undo",
+    "Eval bar",
+];
+
+#[derive(Clone)]
+enum Brain {
+    Builtin(u8),
+    External(Arc<Mutex<GtpEngine>>),
+}
 
 pub struct Session {
     pub game: Game,
-    pub game_mode: GameMode,
+    pub mode: Mode,
     pub human: Stone,
-    pub ai: Stone,
-    pub cursor: (usize, usize),
+    pub cursor: usize,
     pub status: String,
-
-    // AI background thread
-    pub ai_thinking: bool,
-    ai_rx: Option<Receiver<Option<(usize, usize)>>>,
-
-    // GTP engine
-    gtp_engine: Option<Arc<Mutex<GtpEngine>>>,
-
-    // Hints
-    pub hints_remaining: Option<u8>, // None = hints off; Some(255) = unlimited
-    pub hint_move: Option<(usize, usize)>,
-    pub hint_thinking: bool,
-    hint_rx: Option<Receiver<Option<(usize, usize)>>>,
-
-    // Territory overlay
+    pub plays: Vec<(Stone, Play)>,
+    pub positions: Vec<Game>,
+    pub winrates: Vec<Option<f32>>,
+    pub last: Option<usize>,
+    pub clocks: [Option<f64>; 2],
+    pub increment: f64,
+    pub hints_left: u32,
+    pub hint: Option<Play>,
     pub show_territory: bool,
-    pub territory: Option<Vec<Vec<Option<Stone>>>>,
-
-    // Undo
+    pub territory: Option<Vec<Option<Stone>>>,
     pub undo_enabled: bool,
-    undo_stack: Vec<UndoSnapshot>,
+    pub show_eval: bool,
+    pub thinking: bool,
+    pub hint_pending: bool,
+    pub engine_name: String,
+    pub result: String,
 
-    // Move tracking
-    pub last_move: Option<(usize, usize)>,
-    pub history: Vec<MoveRecord>,
-    pub snapshots: Vec<Game>, // board state AFTER each move (for review)
-
-    // Clocks
-    pub clock: [Option<f64>; 2],
-    last_tick: Instant,
-
-    // Setup echo for display
-    pub engine_kind: EngineKind,
-    pub engine_level: u8,
+    brain: Brain,
+    move_box: Option<Receiver<Play>>,
+    hint_box: Option<Receiver<Play>>,
+    eval_box: Option<Receiver<(usize, f32)>>,
+    eval_due: bool,
+    ticked: Instant,
 }
 
 impl Session {
-    pub fn new(setup: &Setup, gnugo_ok: bool) -> Self {
-        let ai_color = setup.human_color.opponent();
-        let mut game = Game::new(setup.board_size);
-
-        // Place handicap stones if requested
+    pub fn new(setup: &Setup, config: &Config, engine_ready: bool) -> Session {
+        let mut game = Game::new(setup.board_size, setup.komi);
         if setup.handicap > 0 {
             game.place_handicap(setup.handicap);
         }
 
-        let center = setup.board_size / 2;
-        let clock = [
-            setup.time_limit.map(|t| t as f64),
-            setup.time_limit.map(|t| t as f64),
-        ];
-
-        let gtp_engine = if setup.game_mode == GameMode::VsAI
-            && setup.engine == EngineKind::GnuGo
-            && gnugo_ok
+        let external = if setup.mode == Mode::Engine
+            && setup.engine == EngineChoice::External
+            && engine_ready
         {
-            GtpEngine::launch_gnugo(setup.engine_level, setup.board_size, game.komi)
-                .map(|e| Arc::new(Mutex::new(e)))
+            GtpEngine::start(&config.engine_command, setup.board_size, setup.komi)
+                .map(|engine| Arc::new(Mutex::new(engine)))
         } else {
             None
         };
 
-        // Sync handicap stones to GTP engine
-        if setup.handicap > 0 {
-            if let Some(ref gtp) = gtp_engine {
-                if let Ok(mut e) = gtp.lock() {
-                    for &(r, c) in &game.handicap_positions(setup.handicap) {
-                        e.play(Stone::Black, r, c);
-                    }
+        if let Some(engine) = &external {
+            if let Ok(mut engine) = engine.lock() {
+                for p in game.handicap_points(setup.handicap) {
+                    engine.play(Stone::Black, Play::Point(p));
                 }
             }
         }
 
-        let mut sess = Session {
-            game,
-            game_mode: setup.game_mode,
-            human: setup.human_color,
-            ai: ai_color,
-            cursor: (center, center),
-            status: String::new(),
-            ai_thinking: false,
-            ai_rx: None,
-            gtp_engine,
-            hints_remaining: setup.hints.starting_count(),
-            hint_move: None,
-            hint_thinking: false,
-            hint_rx: None,
-            show_territory: false,
-            territory: None,
-            undo_enabled: setup.undo_enabled,
-            undo_stack: Vec::new(),
-            last_move: None,
-            history: Vec::new(),
-            snapshots: Vec::new(),
-            clock,
-            last_tick: Instant::now(),
-            engine_kind: setup.engine,
-            engine_level: setup.engine_level,
+        let engine_name = match &external {
+            Some(engine) => engine
+                .lock()
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|_| "engine".to_string()),
+            None => "built-in".to_string(),
         };
 
-        // If human plays White in vs AI mode, AI (Black) goes first
-        if setup.game_mode == GameMode::VsAI && setup.human_color == Stone::White {
-            sess.trigger_ai_move();
-        }
+        let brain = match external {
+            Some(engine) => Brain::External(engine),
+            None => Brain::Builtin(setup.level),
+        };
 
-        sess
+        let clock = setup.main_time.map(|seconds| seconds as f64);
+        let center = game.board.point(setup.board_size / 2, setup.board_size / 2);
+
+        let mut session = Session {
+            positions: vec![game.clone()],
+            winrates: vec![None],
+            game,
+            mode: setup.mode,
+            human: setup.color,
+            cursor: center,
+            status: String::new(),
+            plays: Vec::new(),
+            last: None,
+            clocks: [clock, clock],
+            increment: setup.increment as f64,
+            hints_left: setup.hints,
+            hint: None,
+            show_territory: false,
+            territory: None,
+            undo_enabled: setup.undo,
+            show_eval: setup.eval,
+            thinking: false,
+            hint_pending: false,
+            engine_name,
+            result: String::new(),
+            brain,
+            move_box: None,
+            hint_box: None,
+            eval_box: None,
+            eval_due: false,
+            ticked: Instant::now(),
+        };
+
+        session.request_eval();
+        if session.engine_turn() {
+            session.start_thinking();
+        }
+        session
     }
 
-    // ── Tick (called ~10x per second) ──────────────────────────────────────
+    pub fn engine_turn(&self) -> bool {
+        self.mode == Mode::Engine && self.game.turn != self.human && !self.game.finished
+    }
 
-    pub fn tick(&mut self) -> bool {
-        let elapsed = self.last_tick.elapsed().as_secs_f64();
-        self.last_tick = Instant::now();
+    fn human_turn(&self) -> bool {
+        self.mode == Mode::Friend || self.game.turn == self.human
+    }
 
-        // Check hint thread
-        let hint_result = self.hint_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(mv) = hint_result {
-            self.hint_thinking = false;
-            self.hint_rx = None;
-            self.hint_move = mv;
-            if mv.is_none() {
-                self.status = "AI suggests: pass".to_string();
-            } else if let Some((r, c)) = mv {
-                self.status = format!("Hint: try {}", to_gtp(r, c, self.game.size()));
+    pub fn tick(&mut self) {
+        let elapsed = self.ticked.elapsed().as_secs_f64();
+        self.ticked = Instant::now();
+
+        if let Some(receiver) = &self.hint_box {
+            if let Ok(play) = receiver.try_recv() {
+                self.hint_pending = false;
+                self.hint_box = None;
+                self.hint = Some(play);
+                self.status = format!("try {}", play_name(play, self.game.size()));
             }
         }
 
-        // Check AI move thread
-        let ai_result = self.ai_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(mv) = ai_result {
-            self.ai_thinking = false;
-            self.ai_rx = None;
-            self.apply_ai_move(mv);
-            if self.game.game_over { return true; }
-        }
-
-        // Deduct clock time from current player (only when it's human's turn)
-        if !self.game.game_over && !self.ai_thinking && !self.hint_thinking {
-            let idx = clock_idx(self.game.current);
-            if let Some(ref mut t) = self.clock[idx] {
-                *t -= elapsed;
-                if *t <= 0.0 {
-                    *t = 0.0;
-                    let loser = self.game.current;
-                    self.game.resign(loser);
-                    self.status = format!("{} ran out of time!", color_name(loser));
-                    return true;
+        if let Some(receiver) = &self.eval_box {
+            if let Ok((index, winrate)) = receiver.try_recv() {
+                self.eval_box = None;
+                if index < self.winrates.len() {
+                    self.winrates[index] = Some(winrate);
+                }
+                if self.eval_due {
+                    self.eval_due = false;
+                    self.request_eval();
                 }
             }
         }
-        false
-    }
 
-    // ── Place stone (human action) ─────────────────────────────────────────
-
-    pub fn place_stone(&mut self) -> bool {
-        let (r, c) = self.cursor;
-
-        if self.undo_enabled {
-            self.push_undo();
+        let arrived = self.move_box.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(play) = arrived {
+            self.thinking = false;
+            self.move_box = None;
+            self.apply(self.game.turn, play);
         }
 
-        if !self.game.place(r, c) {
-            self.undo_stack.pop(); // discard the snapshot we just pushed
-            self.status = "Invalid move".to_string();
-            return false;
-        }
-
-        self.hint_move = None;
-        self.last_move = Some((r, c));
-        self.record(self.game.current.opponent(), Some((r, c)));
-        self.snapshots.push(self.game.clone_state());
-        self.status.clear();
-        self.invalidate_territory();
-
-        // Sync GTP engine with human's move
-        if let Some(ref gtp) = self.gtp_engine {
-            if let Ok(mut e) = gtp.lock() {
-                e.play(self.human, r, c);
+        if !self.game.finished && self.human_turn() {
+            let side = side_index(self.game.turn);
+            if let Some(left) = self.clocks[side].as_mut() {
+                *left -= elapsed;
+                if *left <= 0.0 {
+                    *left = 0.0;
+                    let loser = self.game.turn;
+                    self.game.resign(loser);
+                    self.result = format!("{} lost on time", loser.name());
+                }
             }
         }
+    }
 
-        if self.game_mode == GameMode::VsAI && !self.game.game_over {
-            self.trigger_ai_move();
+    pub fn place(&mut self) -> bool {
+        if !self.human_turn() || self.thinking || self.game.finished {
+            return false;
         }
+        let point = self.cursor;
+        if !self.game.legal(point) {
+            self.status = "you cannot play there".to_string();
+            return false;
+        }
+        let color = self.game.turn;
+        self.apply(color, Play::Point(point));
         true
     }
 
     pub fn pass_turn(&mut self) {
-        if self.undo_enabled {
-            self.push_undo();
+        if !self.human_turn() || self.thinking || self.game.finished {
+            return;
         }
-        let passer = self.game.current;
-        self.game.pass();
-        self.record(passer, None);
-        self.snapshots.push(self.game.clone_state());
-        self.status.clear();
-        self.hint_move = None;
-        self.invalidate_territory();
-
-        if let Some(ref gtp) = self.gtp_engine {
-            if let Ok(mut e) = gtp.lock() {
-                e.play_pass(self.human);
-            }
-        }
-
-        if self.game_mode == GameMode::VsAI && !self.game.game_over {
-            self.trigger_ai_move();
-        }
+        let color = self.game.turn;
+        self.apply(color, Play::Pass);
     }
 
     pub fn resign(&mut self) {
-        self.game.resign(self.human);
-        self.status = "You resigned.".to_string();
-    }
-
-    // ── Undo ──────────────────────────────────────────────────────────────
-
-    pub fn undo(&mut self) {
-        if self.ai_thinking || self.hint_thinking { return; }
-        if let Some(snap) = self.undo_stack.pop() {
-            // Count how many moves to roll back in GTP (1 per ply undone)
-            let moves_undone = self.history.len() - snap.history_len;
-            self.game = snap.game;
-            self.last_move = snap.last_move;
-            self.history.truncate(snap.history_len);
-            self.snapshots.truncate(snap.snapshots_len);
-            self.hint_move = None;
-            self.status = "Move undone.".to_string();
-            self.invalidate_territory();
-
-            if let Some(ref gtp) = self.gtp_engine {
-                if let Ok(mut e) = gtp.lock() {
-                    for _ in 0..moves_undone {
-                        e.undo();
-                    }
-                }
-            }
-        } else {
-            self.status = "Nothing to undo.".to_string();
-        }
-    }
-
-    // ── Hints ─────────────────────────────────────────────────────────────
-
-    pub fn request_hint(&mut self) {
-        if self.game_mode == GameMode::TwoPlayer {
-            self.status = "Hints not available in 2-player mode.".to_string();
+        if self.game.finished {
             return;
         }
-        if self.ai_thinking || self.hint_thinking { return; }
-
-        // Check if hints are available
-        match self.hints_remaining {
-            None => {
-                self.status = "Hints are off.".to_string();
-                return;
-            }
-            Some(0) => {
-                self.status = "No hints remaining!".to_string();
-                return;
-            }
-            Some(n) if n != 255 => self.hints_remaining = Some(n - 1),
-            _ => {}
-        }
-
-        self.hint_thinking = true;
-        self.status.clear();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.hint_rx = Some(rx);
-
-        if let Some(ref gtp_arc) = self.gtp_engine {
-            let gtp = Arc::clone(gtp_arc);
-            let color = self.human;
-            std::thread::spawn(move || {
-                let mv = gtp.lock().unwrap().reg_genmove(color);
-                let _ = tx.send(mv);
-            });
+        let loser = if self.mode == Mode::Friend {
+            self.game.turn
         } else {
-            let game = self.game.clone_state();
-            let difficulty = Difficulty::Hard; // hints always use strongest
-            let color = self.human;
-            std::thread::spawn(move || {
-                let mv = best_move(&game, color, difficulty);
-                let _ = tx.send(mv);
-            });
+            self.human
+        };
+        self.game.resign(loser);
+        self.result = format!("{} resigned", loser.name());
+    }
+
+    fn apply(&mut self, color: Stone, play: Play) {
+        self.game.make(play);
+        self.plays.push((color, play));
+        self.positions.push(self.game.clone());
+        self.winrates.push(None);
+        self.last = match play {
+            Play::Point(p) => Some(p),
+            Play::Pass => None,
+        };
+        self.hint = None;
+        self.status.clear();
+        self.refresh_territory();
+
+        if let Some(left) = self.clocks[side_index(color)].as_mut() {
+            *left += self.increment;
+        }
+
+        if let Brain::External(engine) = &self.brain {
+            if self.mode == Mode::Friend || color == self.human {
+                if let Ok(mut engine) = engine.lock() {
+                    engine.play(color, play);
+                }
+            }
+        }
+
+        if play == Play::Pass {
+            self.status = format!("{} passed", color.name());
+        }
+
+        if self.game.finished {
+            if self.result.is_empty() {
+                let lead = self.game.lead();
+                self.result = if lead > 0.0 {
+                    format!("Black wins by {:.1}", lead)
+                } else if lead < 0.0 {
+                    format!("White wins by {:.1}", -lead)
+                } else {
+                    "the game is a draw".to_string()
+                };
+            }
+            return;
+        }
+
+        self.request_eval();
+        if self.engine_turn() {
+            self.start_thinking();
         }
     }
 
-    pub fn hints_label(&self) -> String {
-        match self.hints_remaining {
-            None => "Off".to_string(),
-            Some(255) => "Unlimited".to_string(),
-            Some(0) => "0 left".to_string(),
-            Some(n) => format!("{} left", n),
+    fn start_thinking(&mut self) {
+        let (sender, receiver) = channel();
+        self.move_box = Some(receiver);
+        self.thinking = true;
+        let color = self.game.turn;
+        match self.brain.clone() {
+            Brain::Builtin(level) => {
+                let position = self.game.clone();
+                std::thread::spawn(move || {
+                    let report = ai::pick_move(&position, level);
+                    let _ = sender.send(report.best);
+                });
+            }
+            Brain::External(engine) => {
+                std::thread::spawn(move || {
+                    let play = match engine.lock() {
+                        Ok(mut engine) => engine.genmove(color),
+                        Err(_) => Play::Pass,
+                    };
+                    let _ = sender.send(play);
+                });
+            }
         }
     }
 
-    // ── Territory overlay ─────────────────────────────────────────────────
+    pub fn ask_for_hint(&mut self) {
+        if self.hint_pending || self.thinking || self.game.finished {
+            return;
+        }
+        if self.hints_left == 0 {
+            self.status = "no hints left".to_string();
+            return;
+        }
+        if self.hints_left != u32::MAX {
+            self.hints_left -= 1;
+        }
+        let (sender, receiver) = channel();
+        self.hint_box = Some(receiver);
+        self.hint_pending = true;
+        self.status = "thinking about a good move".to_string();
+        let color = self.game.turn;
+
+        match self.brain.clone() {
+            Brain::Builtin(_) => {
+                let position = self.game.clone();
+                let size = position.size();
+                std::thread::spawn(move || {
+                    let report = ai::search(&position, ai::budget_for(9, size));
+                    let _ = sender.send(report.best);
+                });
+            }
+            Brain::External(engine) => {
+                std::thread::spawn(move || {
+                    let play = match engine.lock() {
+                        Ok(mut engine) => engine.suggest(color),
+                        Err(_) => Play::Pass,
+                    };
+                    let _ = sender.send(play);
+                });
+            }
+        }
+    }
+
+    pub fn request_eval(&mut self) {
+        if !self.show_eval || self.game.finished {
+            return;
+        }
+        if self.eval_box.is_some() {
+            self.eval_due = true;
+            return;
+        }
+        let index = self.positions.len() - 1;
+        if self.winrates[index].is_some() {
+            return;
+        }
+        let (sender, receiver) = channel();
+        self.eval_box = Some(receiver);
+
+        match self.brain.clone() {
+            Brain::Builtin(_) => {
+                let position = self.game.clone();
+                std::thread::spawn(move || {
+                    let winrate = ai::evaluate(&position, Duration::from_millis(500));
+                    let _ = sender.send((index, winrate));
+                });
+            }
+            Brain::External(engine) => {
+                std::thread::spawn(move || {
+                    let lead = engine.lock().ok().and_then(|mut e| e.black_lead());
+                    if let Some(lead) = lead {
+                        let _ = sender.send((index, winrate_from_lead(lead)));
+                    }
+                });
+            }
+        }
+    }
+
+    pub fn toggle_eval(&mut self) {
+        self.show_eval = !self.show_eval;
+        if self.show_eval {
+            self.request_eval();
+        }
+    }
 
     pub fn toggle_territory(&mut self) {
         self.show_territory = !self.show_territory;
-        if self.show_territory && self.territory.is_none() {
-            self.territory = Some(self.game.territory_map());
-        }
+        self.refresh_territory();
     }
 
-    fn invalidate_territory(&mut self) {
-        if self.show_territory {
-            self.territory = Some(self.game.territory_map());
+    fn refresh_territory(&mut self) {
+        self.territory = if self.show_territory {
+            Some(self.game.territory())
         } else {
-            self.territory = None;
-        }
+            None
+        };
     }
 
-    // ── AI move (internal) ────────────────────────────────────────────────
-
-    fn trigger_ai_move(&mut self) {
-        self.ai_thinking = true;
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.ai_rx = Some(rx);
-
-        if let Some(ref gtp_arc) = self.gtp_engine {
-            let gtp = Arc::clone(gtp_arc);
-            let ai_color = self.ai;
-            std::thread::spawn(move || {
-                let mv = gtp.lock().unwrap().genmove(ai_color);
-                let _ = tx.send(mv);
-            });
-        } else {
-            let game = self.game.clone_state();
-            let difficulty = self.difficulty();
-            let ai_color = self.ai;
-            std::thread::spawn(move || {
-                let mv = best_move(&game, ai_color, difficulty);
-                let _ = tx.send(mv);
-            });
+    pub fn undo(&mut self) {
+        if !self.undo_enabled {
+            self.status = "undo is switched off".to_string();
+            return;
         }
-    }
+        if self.thinking || self.hint_pending || self.plays.is_empty() {
+            return;
+        }
 
-    fn apply_ai_move(&mut self, mv: Option<(usize, usize)>) {
-        let mover = self.game.current;
-        match mv {
-            Some((r, c)) => {
-                if self.game.place(r, c) {
-                    self.last_move = Some((r, c));
-                    self.record(mover, Some((r, c)));
-                } else {
-                    self.game.pass();
-                    self.record(mover, None);
+        let mut removed = 0;
+        while self.positions.len() > 1 {
+            self.plays.pop();
+            self.positions.pop();
+            self.winrates.pop();
+            removed += 1;
+            let turn = self.positions.last().map(|p| p.turn);
+            if self.mode == Mode::Friend || turn == Some(self.human) {
+                break;
+            }
+        }
+
+        self.game = self.positions.last().cloned().unwrap();
+        self.last = self.plays.last().and_then(|(_, play)| match play {
+            Play::Point(p) => Some(*p),
+            Play::Pass => None,
+        });
+        self.hint = None;
+        self.result.clear();
+        self.status = "took the move back".to_string();
+        self.refresh_territory();
+
+        if let Brain::External(engine) = &self.brain {
+            if let Ok(mut engine) = engine.lock() {
+                for _ in 0..removed {
+                    engine.undo();
                 }
             }
-            None => {
-                self.game.pass();
-                self.record(mover, None);
+        }
+    }
+
+    pub fn move_cursor(&mut self, rows: i32, cols: i32) {
+        let size = self.game.size() as i32;
+        let (row, col) = self.game.board.row_col(self.cursor);
+        let row = (row as i32 + rows).clamp(0, size - 1) as usize;
+        let col = (col as i32 + cols).clamp(0, size - 1) as usize;
+        self.cursor = self.game.board.point(row, col);
+    }
+
+    pub fn winrate(&self) -> Option<f32> {
+        self.winrates.iter().rev().flatten().next().copied()
+    }
+
+    pub fn clock_text(&self, color: Stone) -> String {
+        match self.clocks[side_index(color)] {
+            None => "--:--".to_string(),
+            Some(left) => {
+                let seconds = left.max(0.0) as u64;
+                format!("{:02}:{:02}", seconds / 60, seconds % 60)
             }
         }
-        self.snapshots.push(self.game.clone_state());
-        self.invalidate_territory();
     }
 
-    fn push_undo(&mut self) {
-        self.undo_stack.push(UndoSnapshot {
-            game: self.game.clone_state(),
-            last_move: self.last_move,
-            history_len: self.history.len(),
-            snapshots_len: self.snapshots.len(),
-        });
-    }
-
-    fn record(&mut self, color: Stone, coord: Option<(usize, usize)>) {
-        self.history.push(MoveRecord { color, coord, num: self.history.len() + 1 });
-    }
-
-    fn difficulty(&self) -> Difficulty {
-        match self.engine_level {
-            1..=3 => Difficulty::Easy,
-            4..=7 => Difficulty::Medium,
-            _ => Difficulty::Hard,
-        }
-    }
-
-    // ── Display helpers ───────────────────────────────────────────────────
-
-    pub fn result_text(&self) -> String {
-        if let Some(winner) = self.game.winner {
-            return format!("{} wins by resignation!", color_name(winner));
-        }
-        let (b, w) = self.game.score();
-        if b > w {
-            format!("Black wins!  B {:.1}  W {:.1}", b, w)
-        } else if w > b {
-            format!("White wins!  B {:.1}  W {:.1}", b, w)
+    pub fn score_text(&self) -> String {
+        let lead = self.game.lead();
+        if lead > 0.0 {
+            format!("B+{:.1}", lead)
+        } else if lead < 0.0 {
+            format!("W+{:.1}", -lead)
         } else {
-            "Draw!".to_string()
+            "even".to_string()
         }
     }
 
-    pub fn score_estimate(&self) -> String {
-        let (b, w) = self.game.score();
-        if b > w { format!("~B+{:.1}", b - w) }
-        else if w > b { format!("~W+{:.1}", w - b) }
-        else { "~Even".to_string() }
-    }
-
-    pub fn format_clock(&self, color: Stone) -> String {
-        match self.clock[clock_idx(color)] {
-            None => "--:--".to_string(),
-            Some(secs) => format!("{:02}:{:02}", secs as u64 / 60, secs as u64 % 60),
+    pub fn record(&self) -> sgf::Record {
+        let mut record = sgf::Record::new(self.game.size(), self.game.komi);
+        record.plays = self.plays.clone();
+        record.setup_black = self.positions[0].handicap_points(self.game.handicap);
+        record.result = self.result.clone();
+        if self.mode == Mode::Friend {
+            record.black_name = "Black".to_string();
+            record.white_name = "White".to_string();
+        } else if self.human == Stone::Black {
+            record.white_name = self.engine_name.clone();
+        } else {
+            record.black_name = self.engine_name.clone();
         }
+        record
     }
 
-    pub fn cursor_coord(&self) -> String {
-        to_gtp(self.cursor.0, self.cursor.1, self.game.size())
-    }
-
-    pub fn engine_name(&self) -> String {
-        if let Some(ref gtp) = self.gtp_engine {
-            if let Ok(e) = gtp.lock() { return e.name.clone(); }
-        }
-        match self.engine_kind {
-            EngineKind::GnuGo => "GNU Go (offline)".to_string(),
-            EngineKind::BuiltIn => format!("Built-in ({})", self.difficulty().label()),
-        }
-    }
-
-    pub fn to_sgf(&self) -> String {
-        let size = self.game.size();
-        let mut s = format!(
-            "(;GM[1]FF[4]SZ[{}]KM[{:.1}]PB[Human]PW[{}]\n",
-            size, self.game.komi, self.engine_name()
-        );
-        for mv in &self.history {
-            let cc = if mv.color == Stone::Black { 'B' } else { 'W' };
-            let coord = match mv.coord {
-                Some((r, c)) => format!("[{}{}]", (b'a' + c as u8) as char, (b'a' + r as u8) as char),
-                None => "[tt]".to_string(),
-            };
-            s.push_str(&format!(";{}{}", cc, coord));
-        }
-        s.push(')');
-        s
-    }
-
-    pub fn save_sgf(&self) -> std::io::Result<String> {
-        let filename = format!(
-            "go_{}.sgf",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        );
-        std::fs::write(&filename, self.to_sgf())?;
-        Ok(filename)
-    }
-
-    pub fn into_review(self) -> ReviewState {
-        ReviewState {
-            pos: self.snapshots.len(), // start at end of game
-            history: self.history,
-            snapshots: self.snapshots,
-        }
+    pub fn save(&self) -> std::io::Result<String> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let name = format!("go-{}-{}.sgf", self.game.size(), stamp);
+        std::fs::write(&name, sgf::write(&self.record()))?;
+        Ok(name)
     }
 }
 
-// ─── App ─────────────────────────────────────────────────────────────────────
+pub struct Review {
+    pub positions: Vec<Game>,
+    pub plays: Vec<(Stone, Play)>,
+    pub at: usize,
+    pub analysis: Analysis,
+    pub title: String,
+    pub show_territory: bool,
+    pub status: String,
+}
+
+impl Review {
+    pub fn new(positions: Vec<Game>, plays: Vec<(Stone, Play)>, title: String) -> Review {
+        let length = positions.len();
+        Review {
+            at: length.saturating_sub(1),
+            positions,
+            plays,
+            analysis: Analysis::idle(length),
+            title,
+            show_territory: false,
+            status: "press a to let the engine go through the game".to_string(),
+        }
+    }
+
+    pub fn game(&self) -> &Game {
+        &self.positions[self.at.min(self.positions.len() - 1)]
+    }
+
+    pub fn step(&mut self, delta: i32) {
+        let last = self.positions.len() as i32 - 1;
+        self.at = (self.at as i32 + delta).clamp(0, last) as usize;
+    }
+
+    pub fn analyse(&mut self) {
+        if self.analysis.running() {
+            self.analysis.cancel();
+            self.status = "analysis stopped".to_string();
+            return;
+        }
+        let seconds = if self.positions[0].size() >= 19 {
+            1.2
+        } else {
+            0.6
+        };
+        self.analysis = Analysis::start(self.positions.clone(), seconds);
+        self.status = "going through the game".to_string();
+    }
+
+    pub fn tick(&mut self) {
+        self.analysis.collect();
+    }
+
+    pub fn suggestion(&self) -> Option<Play> {
+        if self.at == 0 {
+            return None;
+        }
+        self.analysis.best[self.at - 1]
+    }
+}
+
+pub struct Browser {
+    pub files: Vec<PathBuf>,
+    pub selected: usize,
+    pub message: String,
+}
+
+impl Browser {
+    pub fn new() -> Browser {
+        let mut browser = Browser {
+            files: Vec::new(),
+            selected: 0,
+            message: String::new(),
+        };
+        browser.refresh();
+        browser
+    }
+
+    pub fn refresh(&mut self) {
+        let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(".") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("sgf") {
+                    continue;
+                }
+                let modified = entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                found.push((modified, path));
+            }
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0));
+        self.files = found.into_iter().map(|(_, path)| path).collect();
+        self.selected = 0;
+        self.message = if self.files.is_empty() {
+            "no .sgf files in this folder".to_string()
+        } else {
+            String::new()
+        };
+    }
+
+    pub fn move_by(&mut self, delta: i32) {
+        if self.files.is_empty() {
+            return;
+        }
+        let last = self.files.len() as i32 - 1;
+        self.selected = (self.selected as i32 + delta).clamp(0, last) as usize;
+    }
+}
 
 pub struct App {
     pub screen: Screen,
     pub setup: Setup,
     pub session: Option<Session>,
-    pub menu_selected: usize,
-    pub gnugo_available: bool,
-    pub review: Option<ReviewState>,
+    pub review: Option<Review>,
+    pub browser: Browser,
+    pub menu: usize,
+    pub config: Config,
+    pub theme: Theme,
+    pub engine_ready: bool,
+    pub quit: bool,
 }
 
+pub const MENU_ITEMS: [&str; 5] = [
+    "Play a game",
+    "Look at a saved game",
+    "Change the look",
+    "How to play",
+    "Quit",
+];
+
 impl App {
-    pub fn new(gnugo_available: bool) -> Self {
-        Self {
-            screen: Screen::Menu,
-            setup: Setup::default(),
-            session: None,
-            menu_selected: 0,
-            gnugo_available,
-            review: None,
+    pub fn new() -> App {
+        let config = Config::load();
+        let engine_ready = engine_installed(&config.engine_command);
+        let mut setup = Setup::from_config(&config);
+        if !engine_ready {
+            setup.engine = EngineChoice::Builtin;
         }
+        App {
+            screen: Screen::Menu,
+            theme: theme_at(config.theme),
+            setup,
+            session: None,
+            review: None,
+            browser: Browser::new(),
+            menu: 0,
+            config,
+            engine_ready,
+            quit: false,
+        }
+    }
+
+    pub fn engine_label(&self) -> String {
+        self.config
+            .engine_command
+            .split_whitespace()
+            .next()
+            .unwrap_or("engine")
+            .to_string()
     }
 
     pub fn start_game(&mut self) {
         self.review = None;
-        self.session = Some(Session::new(&self.setup, self.gnugo_available));
+        self.session = Some(Session::new(&self.setup, &self.config, self.engine_ready));
+        self.config.board_size = self.setup.board_size;
+        self.config.level = self.setup.level;
+        self.config.komi = self.setup.komi;
+        self.config.show_eval = self.setup.eval;
+        self.config.save();
         self.screen = Screen::Playing;
     }
 
-    pub fn enter_review(&mut self) {
-        if let Some(sess) = self.session.take() {
-            self.review = Some(sess.into_review());
+    pub fn next_theme(&mut self, forward: bool) {
+        let count = crate::theme::THEMES.len();
+        self.config.theme = if forward {
+            (self.config.theme + 1) % count
+        } else {
+            (self.config.theme + count - 1) % count
+        };
+        self.theme = theme_at(self.config.theme);
+        self.config.save();
+    }
+
+    pub fn review_current_game(&mut self) {
+        if let Some(session) = &self.session {
+            let title = format!("{0}x{0} game", session.game.size());
+            let mut review = Review::new(session.positions.clone(), session.plays.clone(), title);
+            for (index, winrate) in session.winrates.iter().enumerate() {
+                if let Some(value) = winrate {
+                    review.analysis.winrates[index] = Some(*value);
+                }
+            }
+            self.review = Some(review);
             self.screen = Screen::Review;
         }
     }
 
-    pub fn tick(&mut self) -> bool {
-        if self.screen == Screen::Playing {
-            if let Some(ref mut sess) = self.session {
-                if sess.tick() || sess.game.game_over {
-                    self.screen = Screen::GameOver;
-                    return true;
+    pub fn open_selected_file(&mut self) {
+        let path = match self.browser.files.get(self.browser.selected) {
+            Some(path) => path.clone(),
+            None => return,
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(_) => {
+                self.browser.message = "could not read that file".to_string();
+                return;
+            }
+        };
+        match sgf::read(&text) {
+            Some(record) => {
+                let positions = sgf::positions(&record);
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("game")
+                    .to_string();
+                self.review = Some(Review::new(positions, record.plays.clone(), name));
+                self.screen = Screen::Review;
+            }
+            None => self.browser.message = "that file is not a game record".to_string(),
+        }
+    }
+
+    pub fn tick(&mut self) {
+        match self.screen {
+            Screen::Playing => {
+                if let Some(session) = &mut self.session {
+                    session.tick();
                 }
             }
+            Screen::Review => {
+                if let Some(review) = &mut self.review {
+                    review.tick();
+                }
+            }
+            _ => {}
         }
-        false
     }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-pub fn color_name(color: Stone) -> &'static str {
-    match color { Stone::Black => "Black", Stone::White => "White", Stone::Empty => "Nobody" }
+fn side_index(color: Stone) -> usize {
+    if color == Stone::Black { 0 } else { 1 }
 }
 
-fn clock_idx(color: Stone) -> usize {
-    if color == Stone::Black { 0 } else { 1 }
+fn on_off(value: bool) -> String {
+    if value { "on" } else { "off" }.to_string()
+}
+
+fn step(value: u8, low: u8, high: u8, forward: bool) -> u8 {
+    if forward {
+        (value + 1).min(high)
+    } else {
+        value.saturating_sub(1).max(low)
+    }
+}
+
+fn cycle<T: PartialEq + Copy>(options: &[T], current: T, forward: bool) -> T {
+    let count = options.len();
+    let at = options.iter().position(|item| *item == current).unwrap_or(0);
+    if forward {
+        options[(at + 1) % count]
+    } else {
+        options[(at + count - 1) % count]
+    }
 }
