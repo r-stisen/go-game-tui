@@ -1,245 +1,212 @@
 mod ai;
+mod analysis;
 mod app;
+mod config;
 mod game;
 mod gtp;
+mod sgf;
+mod theme;
 mod ui;
 
+use app::{App, Screen, SETUP_ROWS, MENU_ITEMS};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use std::time::Duration;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{backend::CrosstermBackend, Terminal};
-use app::{App, EngineKind, GameMode, Screen};
-use gtp::gnugo_available;
 
 fn main() -> io::Result<()> {
-    let gnugo = gnugo_available();
-
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut out = io::stdout();
+    execute!(out, EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
-    let result = run(&mut terminal, gnugo);
+    let outcome = run(&mut terminal);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-    result
+    outcome
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, gnugo: bool) -> io::Result<()> {
-    let mut app = App::new(gnugo);
-    if !gnugo {
-        app.setup.engine = EngineKind::BuiltIn;
-    }
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    let mut app = App::new();
 
-    loop {
-        terminal.draw(|f| ui::render(f, &app))?;
+    while !app.quit {
+        terminal.draw(|frame| ui::render(frame, &app))?;
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(80))? {
             if let Event::Key(key) = event::read()? {
-                if handle_input(&mut app, key.code, key.modifiers) {
-                    break;
+                if key.kind != KeyEventKind::Release {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        break;
+                    }
+                    handle(&mut app, key.code);
                 }
             }
-        } else {
-            app.tick();
         }
+        app.tick();
     }
     Ok(())
 }
 
-fn handle_input(app: &mut App, key: KeyCode, mods: KeyModifiers) -> bool {
-    if mods.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('c') {
-        return true;
+fn handle(app: &mut App, key: KeyCode) {
+    if key == KeyCode::Tab {
+        app.next_theme(true);
+        return;
     }
     match app.screen {
-        Screen::Menu => menu(app, key),
-        Screen::Setup => setup(app, key),
-        Screen::Playing => playing(app, key),
-        Screen::Review => review(app, key),
-        Screen::GameOver => game_over(app, key),
+        Screen::Menu => menu_keys(app, key),
+        Screen::Setup => setup_keys(app, key),
+        Screen::Playing => playing_keys(app, key),
+        Screen::Review => review_keys(app, key),
+        Screen::Browser => browser_keys(app, key),
+        Screen::Themes => theme_keys(app, key),
+        Screen::Help => app.screen = Screen::Menu,
     }
 }
 
-// ─── Menu ─────────────────────────────────────────────────────────────────────
-
-fn menu(app: &mut App, key: KeyCode) -> bool {
+fn menu_keys(app: &mut App, key: KeyCode) {
     match key {
-        KeyCode::Up | KeyCode::Char('k') => { if app.menu_selected > 0 { app.menu_selected -= 1; } }
-        KeyCode::Down | KeyCode::Char('j') => { if app.menu_selected < 1 { app.menu_selected += 1; } }
-        KeyCode::Enter => {
-            if app.menu_selected == 0 { app.screen = Screen::Setup; } else { return true; }
+        KeyCode::Up | KeyCode::Char('k') => app.menu = app.menu.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.menu = (app.menu + 1).min(MENU_ITEMS.len() - 1)
         }
-        KeyCode::Char('q') => return true,
+        KeyCode::Enter => match app.menu {
+            0 => app.screen = Screen::Setup,
+            1 => {
+                app.browser.refresh();
+                app.screen = Screen::Browser;
+            }
+            2 => app.screen = Screen::Themes,
+            3 => app.screen = Screen::Help,
+            _ => app.quit = true,
+        },
+        KeyCode::Char('q') => app.quit = true,
         _ => {}
     }
-    false
 }
 
-// ─── Setup ────────────────────────────────────────────────────────────────────
-
-const SETUP_ROWS: usize = 9; // rows 0-8
-
-fn setup(app: &mut App, key: KeyCode) -> bool {
-    let s = &mut app.setup;
-    let vs_ai = s.game_mode == GameMode::VsAI;
-
+fn setup_keys(app: &mut App, key: KeyCode) {
     match key {
-        KeyCode::Up | KeyCode::Char('k') => { if s.selected > 0 { s.selected -= 1; } }
-        KeyCode::Down | KeyCode::Char('j') => { if s.selected < SETUP_ROWS - 1 { s.selected += 1; } }
-        KeyCode::Left | KeyCode::Char('h') => change_setup(s, false, vs_ai),
-        KeyCode::Right | KeyCode::Char('l') => change_setup(s, true, vs_ai),
+        KeyCode::Up | KeyCode::Char('k') => app.setup.row = app.setup.row.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.setup.row = (app.setup.row + 1).min(SETUP_ROWS - 1)
+        }
+        KeyCode::Left | KeyCode::Char('h') => app.setup.change(false),
+        KeyCode::Right | KeyCode::Char('l') => app.setup.change(true),
         KeyCode::Enter => app.start_game(),
         KeyCode::Esc => app.screen = Screen::Menu,
-        KeyCode::Char('q') => return true,
+        KeyCode::Char('q') => app.quit = true,
         _ => {}
     }
-    false
 }
 
-fn change_setup(s: &mut app::Setup, forward: bool, vs_ai: bool) {
-    match s.selected {
-        0 => s.board_size = cycle_board_size(s.board_size, forward),
-        1 => s.game_mode = if forward {
-            match s.game_mode { GameMode::VsAI => GameMode::TwoPlayer, _ => GameMode::VsAI }
-        } else {
-            match s.game_mode { GameMode::TwoPlayer => GameMode::VsAI, _ => GameMode::TwoPlayer }
-        },
-        2 if vs_ai => s.engine = match s.engine { EngineKind::BuiltIn => EngineKind::GnuGo, _ => EngineKind::BuiltIn },
-        3 if vs_ai => {
-            if forward { if s.engine_level < 10 { s.engine_level += 1; } }
-            else       { if s.engine_level > 1  { s.engine_level -= 1; } }
+fn playing_keys(app: &mut App, key: KeyCode) {
+    let over = app
+        .session
+        .as_ref()
+        .map(|session| session.game.finished)
+        .unwrap_or(false);
+
+    if over {
+        match key {
+            KeyCode::Char('v') => app.review_current_game(),
+            KeyCode::Char('s') => save_current(app),
+            KeyCode::Char('n') => app.screen = Screen::Setup,
+            KeyCode::Esc => app.screen = Screen::Menu,
+            KeyCode::Char('q') => app.quit = true,
+            _ => {}
         }
-        4 => s.human_color = s.human_color.opponent(),
-        5 if vs_ai => s.hints = if forward { s.hints.next() } else { s.hints.prev() },
-        6 => s.undo_enabled = !s.undo_enabled,
-        7 => s.handicap = cycle_handicap(s.handicap, forward),
-        8 => s.time_limit = if forward { next_time(s.time_limit) } else { prev_time(s.time_limit) },
-        _ => {}
-    }
-}
-
-// ─── Playing ──────────────────────────────────────────────────────────────────
-
-fn playing(app: &mut App, key: KeyCode) -> bool {
-    let sess = match &mut app.session { Some(s) => s, None => return false };
-
-    // Always allow quit
-    if key == KeyCode::Char('q') { return true; }
-
-    // Block most keys while AI computes
-    if sess.ai_thinking {
-        return false;
+        return;
     }
 
-    if sess.game.game_over {
-        // Redirect to game over screen on any key
-        app.screen = Screen::GameOver;
-        return false;
-    }
-
-    let size = sess.game.size();
-    let mut ended = false;
+    let session = match &mut app.session {
+        Some(session) => session,
+        None => return,
+    };
 
     match key {
-        // Cursor movement
-        KeyCode::Up    | KeyCode::Char('k') => { if sess.cursor.0 + 1 < size { sess.cursor.0 += 1; } sess.hint_move = None; }
-        KeyCode::Down  | KeyCode::Char('j') => { if sess.cursor.0 > 0        { sess.cursor.0 -= 1; } sess.hint_move = None; }
-        KeyCode::Left  | KeyCode::Char('h') => { if sess.cursor.1 > 0        { sess.cursor.1 -= 1; } sess.hint_move = None; }
-        KeyCode::Right | KeyCode::Char('l') => { if sess.cursor.1 + 1 < size { sess.cursor.1 += 1; } sess.hint_move = None; }
-        // Place stone
+        KeyCode::Up | KeyCode::Char('k') => session.move_cursor(-1, 0),
+        KeyCode::Down | KeyCode::Char('j') => session.move_cursor(1, 0),
+        KeyCode::Left | KeyCode::Char('h') => session.move_cursor(0, -1),
+        KeyCode::Right | KeyCode::Char('l') => session.move_cursor(0, 1),
         KeyCode::Enter | KeyCode::Char(' ') => {
-            sess.place_stone();
-            ended = sess.game.game_over;
+            session.place();
         }
-        // Pass
-        KeyCode::Char('p') => {
-            sess.pass_turn();
-            ended = sess.game.game_over;
-        }
-        // Resign
-        KeyCode::Char('r') => { sess.resign(); ended = true; }
-        // Hint
-        KeyCode::Char('?') => sess.request_hint(),
-        // Territory overlay
-        KeyCode::Char('t') => sess.toggle_territory(),
-        // Undo
-        KeyCode::Char('u') => sess.undo(),
-        // Save SGF
-        KeyCode::Char('s') => {
-            match sess.save_sgf() {
-                Ok(f) => sess.status = format!("Saved {}", f),
-                Err(e) => sess.status = format!("Save error: {}", e),
-            }
-        }
+        KeyCode::Char('p') => session.pass_turn(),
+        KeyCode::Char('u') => session.undo(),
+        KeyCode::Char('?') | KeyCode::Char('i') => session.ask_for_hint(),
+        KeyCode::Char('t') => session.toggle_territory(),
+        KeyCode::Char('e') => session.toggle_eval(),
+        KeyCode::Char('r') => session.resign(),
+        KeyCode::Char('s') => save_current(app),
+        KeyCode::Esc => app.screen = Screen::Menu,
+        KeyCode::Char('q') => app.quit = true,
         _ => {}
     }
-
-    if ended { app.screen = Screen::GameOver; }
-    false
 }
 
-// ─── Review ───────────────────────────────────────────────────────────────────
-
-fn review(app: &mut App, key: KeyCode) -> bool {
-    let rv = match &mut app.review { Some(r) => r, None => return false };
+fn review_keys(app: &mut App, key: KeyCode) {
+    let review = match &mut app.review {
+        Some(review) => review,
+        None => return,
+    };
     match key {
-        KeyCode::Right | KeyCode::Char('l') => rv.step_forward(),
-        KeyCode::Left  | KeyCode::Char('h') => rv.step_back(),
-        KeyCode::Char('0') => rv.pos = 0,
-        KeyCode::Char('$') => { let t = rv.total(); rv.pos = t; }
-        KeyCode::Esc | KeyCode::Char('q') => app.screen = Screen::GameOver,
-        _ => {}
-    }
-    false
-}
-
-// ─── Game over ────────────────────────────────────────────────────────────────
-
-fn game_over(app: &mut App, key: KeyCode) -> bool {
-    match key {
-        KeyCode::Char('v') => app.enter_review(),
-        KeyCode::Char('s') => {
-            if let Some(ref sess) = app.session {
-                let _ = sess.save_sgf();
-            }
+        KeyCode::Left | KeyCode::Char('h') => review.step(-1),
+        KeyCode::Right | KeyCode::Char('l') => review.step(1),
+        KeyCode::Down | KeyCode::Char('j') => review.step(-10),
+        KeyCode::Up | KeyCode::Char('k') => review.step(10),
+        KeyCode::Home | KeyCode::Char('0') => review.at = 0,
+        KeyCode::End | KeyCode::Char('$') => review.at = review.positions.len() - 1,
+        KeyCode::Char('a') => review.analyse(),
+        KeyCode::Char('t') => review.show_territory = !review.show_territory,
+        KeyCode::Esc => {
+            review.analysis.cancel();
+            app.screen = if app.session.is_some() {
+                Screen::Playing
+            } else {
+                Screen::Menu
+            };
         }
-        KeyCode::Char('n') => { app.session = None; app.screen = Screen::Setup; }
-        KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Char('q') => app.quit = true,
         _ => {}
     }
-    false
 }
 
-// ─── Option cycling helpers ───────────────────────────────────────────────────
-
-fn cycle_board_size(cur: usize, forward: bool) -> usize {
-    let opts = [9usize, 13, 19];
-    let pos = opts.iter().position(|&x| x == cur).unwrap_or(2);
-    if forward { opts[(pos + 1) % 3] } else { opts[(pos + 2) % 3] }
+fn browser_keys(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => app.browser.move_by(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.browser.move_by(1),
+        KeyCode::Enter => app.open_selected_file(),
+        KeyCode::Char('r') => app.browser.refresh(),
+        KeyCode::Esc => app.screen = Screen::Menu,
+        KeyCode::Char('q') => app.quit = true,
+        _ => {}
+    }
 }
 
-const HANDICAP_OPTIONS: [u8; 7] = [0, 2, 3, 4, 5, 6, 9];
-
-fn cycle_handicap(cur: u8, forward: bool) -> u8 {
-    let pos = HANDICAP_OPTIONS.iter().position(|&x| x == cur).unwrap_or(0);
-    let n = HANDICAP_OPTIONS.len();
-    if forward { HANDICAP_OPTIONS[(pos + 1) % n] } else { HANDICAP_OPTIONS[(pos + n - 1) % n] }
+fn theme_keys(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Left | KeyCode::Char('h') => app.next_theme(false),
+        KeyCode::Right | KeyCode::Char('l') => app.next_theme(true),
+        KeyCode::Enter | KeyCode::Esc => app.screen = Screen::Menu,
+        KeyCode::Char('q') => app.quit = true,
+        _ => {}
+    }
 }
 
-const TIME_OPTIONS: [Option<u64>; 5] = [None, Some(180), Some(300), Some(600), Some(1200)];
+fn save_current(app: &mut App) {
+    if let Some(session) = &mut app.session {
+        session.status = match session.save() {
+            Ok(name) => format!("saved as {}", name),
+            Err(problem) => format!("could not save: {}", problem),
+        };
+    }
+}
 
-fn next_time(cur: Option<u64>) -> Option<u64> {
-    let pos = TIME_OPTIONS.iter().position(|&t| t == cur).unwrap_or(0);
-    TIME_OPTIONS[(pos + 1) % TIME_OPTIONS.len()]
-}
-fn prev_time(cur: Option<u64>) -> Option<u64> {
-    let pos = TIME_OPTIONS.iter().position(|&t| t == cur).unwrap_or(0);
-    TIME_OPTIONS[(pos + TIME_OPTIONS.len() - 1) % TIME_OPTIONS.len()]
-}
