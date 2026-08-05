@@ -210,3 +210,153 @@ fn save_current(app: &mut App) {
     }
 }
 
+#[cfg(test)]
+mod screens {
+    use super::*;
+    use crate::game::Play;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn draw(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for row in 0..buffer.area.height {
+            for col in 0..buffer.area.width {
+                text.push_str(buffer[(col, row)].symbol());
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn the_menus_draw() {
+        let mut app = App::new();
+        for screen in [
+            Screen::Menu,
+            Screen::Setup,
+            Screen::Browser,
+            Screen::Themes,
+            Screen::Help,
+        ] {
+            app.screen = screen;
+            for (width, height) in [(100, 34), (70, 24), (40, 12)] {
+                draw(&app, width, height);
+            }
+        }
+        assert!(draw(&app, 100, 34).contains("crossings"));
+    }
+
+    #[test]
+    fn the_board_lines_up_with_the_letters() {
+        let mut app = App::new();
+        app.setup.board_size = 9;
+        app.setup.engine = app::EngineChoice::Builtin;
+        app.setup.mode = app::Mode::Friend;
+        app.start_game();
+        if let Some(session) = &mut app.session {
+            session.cursor = session.game.board.point(4, 4);
+            session.place();
+            session.hint = Some(Play::Point(session.game.board.point(2, 2)));
+            session.toggle_territory();
+        }
+        let screen = draw(&app, 100, 34);
+        assert!(screen.contains("A B C D E F G H J"));
+        assert!(screen.contains("\u{25cf}"));
+
+        app.review_current_game();
+        for (width, height) in [(100, 34), (60, 20), (30, 10)] {
+            draw(&app, width, height);
+        }
+    }
+}
+
+#[cfg(test)]
+mod games {
+    use super::*;
+    use crate::game::Play;
+    use std::time::{Duration, Instant};
+
+    fn play_out(app: &mut App) -> usize {
+        let mut moves = 0;
+        let start = Instant::now();
+        while moves < 40 && start.elapsed() < Duration::from_secs(60) {
+            app.tick();
+            let session = app.session.as_mut().unwrap();
+            if session.game.finished {
+                break;
+            }
+            if session.thinking {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            if session.game.turn == session.human || session.mode == app::Mode::Friend {
+                let spot = (0..session.game.board.points())
+                    .find(|&p| session.game.legal(p));
+                match spot {
+                    Some(p) => {
+                        session.cursor = p;
+                        assert!(session.place());
+                    }
+                    None => session.pass_turn(),
+                }
+                moves += 1;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        moves
+    }
+
+    #[test]
+    fn a_game_against_the_builtin_engine_runs() {
+        let mut app = App::new();
+        app.setup.board_size = 9;
+        app.setup.engine = app::EngineChoice::Builtin;
+        app.setup.level = 2;
+        app.start_game();
+        let moves = play_out(&mut app);
+        let session = app.session.as_ref().unwrap();
+        assert!(moves > 5);
+        assert!(session.plays.len() >= moves);
+        println!("builtin: {} plays, score {}", session.plays.len(), session.score_text());
+    }
+
+    #[test]
+    fn a_game_against_gnugo_runs() {
+        let mut app = App::new();
+        if !app.engine_ready {
+            return;
+        }
+        app.setup.board_size = 9;
+        app.setup.engine = app::EngineChoice::External;
+        app.setup.handicap = 2;
+        app.start_game();
+        let moves = play_out(&mut app);
+        let session = app.session.as_ref().unwrap();
+        println!("gnugo: {} plays as {}", session.plays.len(), session.engine_name);
+        assert!(moves > 5);
+        assert!(session.plays.iter().any(|(_, play)| *play != Play::Pass));
+        assert!(session.engine_name.to_lowercase().contains("gnu"));
+        assert!(session.winrate().is_some());
+    }
+
+    #[test]
+    fn undo_takes_back_both_moves() {
+        let mut app = App::new();
+        app.setup.board_size = 9;
+        app.setup.engine = app::EngineChoice::Builtin;
+        app.setup.level = 1;
+        app.start_game();
+        let session = app.session.as_mut().unwrap();
+        session.cursor = session.game.board.point(4, 4);
+        session.place();
+        while session.thinking {
+            session.tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(session.plays.len(), 2);
+        session.undo();
+        assert_eq!(session.plays.len(), 0);
+        assert_eq!(session.game.turn, session.human);
+    }
+}
