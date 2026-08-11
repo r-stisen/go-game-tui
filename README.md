@@ -99,7 +99,7 @@ The cursor shows as a yellow highlight on the board. The info panel on the right
 
 **Medium** uses simple heuristics. It will try to capture your stones and connect its own. A decent challenge for beginners.
 
-**Hard** uses Monte Carlo Tree Search (MCTS) with about 1.5 seconds of thinking time per move. It plays stronger but is not perfect.
+**Hard** uses Monte Carlo Tree Search (MCTS) with about 1.5 seconds of thinking time per move. It plays stronger but is not perfect
 
 ---
 
