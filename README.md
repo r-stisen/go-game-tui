@@ -5,13 +5,7 @@ look through the game afterwards with an eval bar and a move by move judgement.
 
 Written in Rust with [ratatui](https://github.com/ratatui/ratatui).
 
-```
-   A B C D E F G H J K L M N O P Q R S T
-19 ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐ 19
-18 ├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤ 18
-17 ├─┼─┼─●─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─○─┼─┼─┤ 17
-16 ├─┼─┼─┼─┼─┼─┼─┼─┼─╋─┼─┼─┼─┼─┼─┼─┼─┼─┤ 16
-```
+![a game in progress, eval bar on the left](assets/screenshot.png)
 
 ## What you get
 
