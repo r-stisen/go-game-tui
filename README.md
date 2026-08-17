@@ -1,8 +1,7 @@
 # go-tui
 
 Go in the terminal. Play a friend on the same keyboard, play the computer, and
-look through the game afterwards with an eval bar and a move by move judgement,
-the way you would on a chess site.
+look through the game afterwards with an eval bar and a move by move judgement.
 
 Written in Rust with [ratatui](https://github.com/ratatui/ratatui).
 
